@@ -105,7 +105,14 @@ def write_json(path: Path, payload: Any) -> None:
     )
     tmp = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # fdopen does not take ownership of the descriptor until it
+            # succeeds, so on failure it is still ours to close.
+            os.close(fd)
+            raise
+        with handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False, default=str)
         os.chmod(tmp, FILE_MODE)
         tmp.replace(path)

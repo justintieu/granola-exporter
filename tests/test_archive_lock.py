@@ -199,3 +199,83 @@ def test_interrupt_saves_the_index_while_the_lock_is_still_held(
 
     assert cli.main(["sync", "--source", "mcp"]) == 130
     assert held_during_save == [True], "index was saved after the lock released"
+
+
+def test_a_hard_kill_leaves_a_temp_file_that_the_next_sync_sweeps(
+    tmp_path: Path, isolated_state: Path
+):
+    """Orphans from a SIGKILL must not accumulate one per kill.
+
+    write_json cleans up after any exception, but a signal leaves its temp
+    file on disk. Each has a unique name, so nothing predictable finds them;
+    the sweep runs under the lock, the only point at which deleting another
+    writer's temp file is impossible.
+    """
+    root = tmp_path / "archive"
+    meeting = root / "2026" / "01" / "2026-01-01--standup--mcp_abc"
+    meeting.mkdir(parents=True)
+    orphans = [
+        meeting / "raw.json.1ocrxess.tmp",
+        meeting / "raw.json.63pz5y16.tmp",
+        meeting / "raw.json.tmp",
+        root / "index.json.9y8rrcr7.tmp",
+    ]
+    for orphan in orphans:
+        orphan.write_text("partial")
+    keep = meeting / "notes.tmp"
+    keep.write_text("not ours")
+    real = meeting / "raw.json"
+    real.write_text("{}")
+
+    archive = Archive(root)
+    with archive.exclusive():
+        pass
+
+    assert not [o for o in orphans if o.exists()], "orphans survived the sweep"
+    assert keep.exists(), "swept a file this module never wrote"
+    assert real.exists(), "swept a real archive file"
+
+
+def test_the_sweep_is_quiet_on_a_missing_archive(tmp_path: Path, isolated_state: Path):
+    """A first-ever sync has nothing to sweep and must not create the root."""
+    archive = Archive(tmp_path / "archive")
+
+    assert archive.sweep_stale_temp_files() == 0
+    assert not archive.root.exists()
+
+
+def test_the_sweep_leaves_a_nested_profile_archive_alone(
+    tmp_path: Path, isolated_state: Path
+):
+    """A --profile archive nests inside the default one and has its own lock.
+
+    Regression test: the sweep walked into it and deleted the profile sync's
+    in-flight temp file, crashing a run that had done nothing wrong -- the
+    exact failure the unique temp names were added to prevent. Holding this
+    archive's lock says nothing about the nested archive's.
+    """
+    default_root = tmp_path / "archive"
+    profile_root = default_root / "work"
+    profile_meeting = profile_root / "2026" / "01" / "2026-01-01--standup--mcp_abc"
+    profile_meeting.mkdir(parents=True)
+    (profile_root / ".sync-state.json").write_text("{}")
+    in_flight = profile_meeting / "raw.json.abc12345.tmp"
+    in_flight.write_text("being written right now")
+
+    own_meeting = default_root / "2026" / "01" / "2026-01-01--mine--mcp_def"
+    own_meeting.mkdir(parents=True)
+    own_orphan = own_meeting / "raw.json.99999999.tmp"
+    own_orphan.write_text("mine, stale")
+
+    default_archive = Archive(default_root)
+    profile_archive = Archive(profile_root)
+    assert default_archive.lock_path != profile_archive.lock_path, (
+        "the two archives must take different locks, which is why the sweep "
+        "cannot assume it owns this whole tree"
+    )
+
+    with default_archive.exclusive():
+        pass
+
+    assert in_flight.exists(), "swept another archive's in-flight temp file"
+    assert not own_orphan.exists(), "failed to sweep its own orphan"

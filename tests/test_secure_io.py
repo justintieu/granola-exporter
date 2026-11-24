@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
+
+import pytest
 
 from granola_exporter.secure_io import FILE_MODE, write_json
 
@@ -61,3 +64,32 @@ def test_write_json_removes_its_temp_file_when_the_write_fails(tmp_path: Path):
         raise AssertionError("expected the write to fail")
 
     assert not list(tmp_path.glob("*.tmp")), "temp file left behind"
+
+
+def test_write_json_does_not_leak_the_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch
+):
+    """``fdopen`` does not own the fd until it succeeds, so it must be closed.
+
+    Counting with ``dup`` rather than ``/dev/fd``: the lowest descriptor the
+    kernel hands out is stable if nothing leaked, and climbs by one per leak.
+    """
+    target = tmp_path / "raw.json"
+
+    def lowest_free_fd() -> int:
+        fd = os.dup(0)
+        os.close(fd)
+        return fd
+
+    def explode(*_args, **_kwargs):
+        raise OSError("no streams today")
+
+    before = lowest_free_fd()
+    monkeypatch.setattr(os, "fdopen", explode)
+
+    for _ in range(10):
+        with pytest.raises(OSError, match="no streams today"):
+            write_json(target, {"x": 1})
+
+    monkeypatch.undo()
+    assert lowest_free_fd() == before, "write_json leaked a descriptor"

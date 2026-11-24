@@ -30,6 +30,7 @@ import re
 import shutil
 from collections import Counter
 from collections.abc import Iterator
+from fnmatch import fnmatch
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -273,6 +274,10 @@ class Archive:
         however the process ends. That is why this is a lock file with no
         contents and no stale-lock recovery: there is no PID to go stale.
 
+        Holding the lock is also the only moment at which temp files from a
+        previous hard kill can safely be removed, so that happens here. See
+        :meth:`sweep_stale_temp_files`.
+
         Raises:
             ArchiveBusy: Another process holds the archive.
         """
@@ -291,9 +296,63 @@ class Archive:
                 if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
                     raise
                 raise ArchiveBusy(self.root) from exc
+            self.sweep_stale_temp_files()
             yield
         finally:
             os.close(fd)
+
+    def sweep_stale_temp_files(self) -> int:
+        """Delete atomic-write temp files a hard kill left behind.
+
+        ``write_json`` removes its own temp file on any exception, but a
+        ``SIGKILL``, a power loss or a lid close leaves one on disk. Each
+        has a unique name, so they accumulate one per kill and no
+        predictable path finds them; the old fixed ``<dest>.tmp`` name was
+        self-limiting because the next write truncated it.
+
+        The caller must hold :meth:`exclusive`. That is the whole reason
+        this lives here rather than in ``write_json``: a sweep by one of two
+        concurrent writers would delete the other's temp file out from under
+        it, which is the crash the lock exists to prevent.
+
+        Holding this archive's lock is not the same as holding every lock
+        under this directory. A ``--profile`` archive nests inside the
+        default one (``<archive_dir>/<profile>``), has its own lock, and may
+        be syncing right now, so any nested archive root is pruned from the
+        walk. Without that, a default sync deletes a profile sync's
+        in-flight temp file and crashes it.
+
+        Legacy fixed-name temps are matched too, so an archive written by an
+        older build is cleaned on its next sync.
+
+        Returns:
+            How many files were removed.
+        """
+        if not self.root.is_dir():
+            return 0
+        removed = 0
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            here = Path(dirpath)
+            if here != self.root and (
+                (here / STATE_NAME).exists() or (here / INDEX_NAME).exists()
+            ):
+                # Another archive's tree. Not ours to sweep, and it may be
+                # mid-write behind its own lock.
+                dirnames[:] = []
+                continue
+            for name in filenames:
+                # Only this module's own temp shapes, so an unrelated file a
+                # user parked in the archive is left alone.
+                if not fnmatch(name, "*.json.tmp") and not fnmatch(
+                    name, "*.json.*.tmp"
+                ):
+                    continue
+                try:
+                    (here / name).unlink()
+                except OSError:
+                    continue
+                removed += 1
+        return removed
 
     def load_index(self) -> dict[str, dict[str, Any]]:
         """Load the archive index, caching it for the process lifetime.
