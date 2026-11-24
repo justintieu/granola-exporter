@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 from . import __version__
 from .models import SOURCE_MCP
 from .public_api import GranolaAPIError, PublicAPIClient
-from .store import Archive
+from .store import Archive, ArchiveBusy
 from .sync import (
     SyncOptions,
     scan_mcp_meeting_ids,
@@ -604,24 +604,34 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     allow_change = bool(getattr(args, "allow_account_change", False))
     try:
-        if effective == "public-api":
-            if not config.api_key:
-                print(
-                    f"No {api_key_var(config.profile)}. "
-                    "Run 'granola-export doctor' for setup help.",
-                    file=sys.stderr,
-                )
-                return 1
-            with PublicAPIClient(config.api_key) as client:
-                # Before sync_public_api, which writes on its first note.
-                note = _check_account(
-                    archive, client.account_email(), config, allow_change=allow_change
-                )
-                if note:
-                    print(f"  NOTE: {note}", file=sys.stderr)
-                counts = sync_public_api(archive, client, opts)
-        else:
-            counts = _sync_via_mcp(archive, config, opts, allow_change=allow_change)
+        # One writer per archive: the index and the watermark are read once
+        # per process, so a second concurrent sync would overwrite them with
+        # its own stale snapshot.
+        with archive.exclusive():
+            if effective == "public-api":
+                if not config.api_key:
+                    print(
+                        f"No {api_key_var(config.profile)}. "
+                        "Run 'granola-export doctor' for setup help.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                with PublicAPIClient(config.api_key) as client:
+                    # Before sync_public_api, which writes on its first note.
+                    note = _check_account(
+                        archive,
+                        client.account_email(),
+                        config,
+                        allow_change=allow_change,
+                    )
+                    if note:
+                        print(f"  NOTE: {note}", file=sys.stderr)
+                    counts = sync_public_api(archive, client, opts)
+            else:
+                counts = _sync_via_mcp(archive, config, opts, allow_change=allow_change)
+    except ArchiveBusy as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     except AccountMismatch as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
