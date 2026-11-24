@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -83,15 +84,32 @@ def read_json(path: Path, default: Any) -> Any:
 def write_json(path: Path, payload: Any) -> None:
     """Write JSON atomically, so an interrupted run cannot truncate the file.
 
+    The temp name is unique per writer rather than derived from ``path``. Two
+    syncs running at once reach the same meeting and would otherwise pick the
+    same temp path: whichever renamed first left the other's ``replace`` with
+    nothing to rename, crashing a run that had done nothing wrong. Unique
+    names let the loser overwrite with identical content instead, which is
+    correct here because both writers fetched the same note from the same API.
+
+    ``mkstemp`` also creates the file at :data:`FILE_MODE` directly, so there
+    is no window where a file ``SECURITY.md`` documents as owner-only is
+    readable at the process umask.
+
     Args:
         path: Destination file.
         payload: JSON-serializable value.
     """
     secure_mkdir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    # Permissions are set on the temp file *before* the rename, so the final
-    # path is never briefly world-readable.
-    secure_write_text(
-        tmp, json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp"
     )
-    tmp.replace(path)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, default=str)
+        os.chmod(tmp, FILE_MODE)
+        tmp.replace(path)
+    except BaseException:
+        # Leave no temp file behind for a caller that globs the directory.
+        tmp.unlink(missing_ok=True)
+        raise
