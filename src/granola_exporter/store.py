@@ -20,11 +20,15 @@ surviving upstream deletion is the entire point of keeping an archive.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
+import os
 import re
 import shutil
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +59,7 @@ __all__ = [
 
 INDEX_NAME = "index.json"
 STATE_NAME = ".sync-state.json"
+LOCK_NAME = "sync.lock"
 STATE_SCHEMA_VERSION = 2
 RAW_NAME = "raw.json"
 NOTE_NAME = "note.md"
@@ -75,6 +80,19 @@ class UnsafeArchivePathError(ValueError):
     come from the API or from a file on disk. Building paths from them without
     a containment check would allow writes outside the archive.
     """
+
+
+class ArchiveBusy(RuntimeError):
+    """Raised when another process already holds the archive for writing."""
+
+    def __init__(self, root: Path) -> None:
+        """Initialize the error.
+
+        Args:
+            root: The archive another process is syncing.
+        """
+        super().__init__(f"another sync is already running in {root}")
+        self.root = root
 
 
 def _resolve_within(root: Path, *parts: str) -> Path:
@@ -202,6 +220,54 @@ class Archive:
             The ``.sync-state.json`` path.
         """
         return self.root / STATE_NAME
+
+    @property
+    def lock_path(self) -> Path:
+        """Path to this archive's sync lock.
+
+        The lock lives in the state directory rather than in the archive,
+        for two reasons: a lock is runtime state and not archived content,
+        and taking one must not bring an archive directory into existence --
+        a sync that never starts, because the user is logged out, has to
+        leave nothing behind.
+
+        Returns:
+            The lock path, named after a digest of the archive root so two
+            different archives do not contend with each other.
+        """
+        from .mcp_auth import state_dir
+
+        digest = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:16]
+        return state_dir() / f"{LOCK_NAME}-{digest}"
+
+    @contextlib.contextmanager
+    def exclusive(self) -> Iterator[None]:
+        """Hold the archive for one writer, for the duration of the block.
+
+        The index and sync state are read once per process and cached, so two
+        syncs running at once each write a snapshot taken at their own start
+        time: the second silently drops the entries and the watermark the
+        first added. The files on disk survive, but the index that describes
+        them and the watermark that decides what syncs next do not.
+
+        ``flock`` is held by the open descriptor, so the kernel releases it
+        however the process ends. That is why this is a lock file with no
+        contents and no stale-lock recovery: there is no PID to go stale.
+
+        Raises:
+            ArchiveBusy: Another process holds the archive.
+        """
+        lock_path = self.lock_path
+        _secure_mkdir(lock_path.parent)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, FILE_MODE)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise ArchiveBusy(self.root) from exc
+            yield
+        finally:
+            os.close(fd)
 
     def load_index(self) -> dict[str, dict[str, Any]]:
         """Load the archive index, caching it for the process lifetime.
