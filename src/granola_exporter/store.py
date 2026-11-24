@@ -21,6 +21,7 @@ surviving upstream deletion is the entire point of keeping an archive.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -231,13 +232,31 @@ class Archive:
         a sync that never starts, because the user is logged out, has to
         leave nothing behind.
 
+        The digest is taken over the case-folded root. ``.resolve()`` fixes
+        ``..`` and trailing slashes but leaves case alone, and on a
+        case-insensitive filesystem -- the macOS default -- two spellings of
+        one archive would otherwise take two locks and both syncs would run.
+        ``os.path.normcase`` is a no-op outside Windows, so it cannot do
+        this job. Folding unconditionally costs only a spurious "already
+        running" for two *different* archives whose paths differ by case
+        alone on a case-sensitive filesystem; a loud refusal is the better
+        failure of the two.
+
+        It remains a path identity, not an inode identity: the same
+        directory reached through a macOS firmlink (a
+        ``/System/Volumes/Data`` prefix) resolves to a different string and
+        takes a different lock. ``st_dev``/``st_ino`` would settle it but
+        needs the archive to exist, which would defeat not creating one for
+        a sync that never starts.
+
         Returns:
             The lock path, named after a digest of the archive root so two
             different archives do not contend with each other.
         """
         from .mcp_auth import state_dir
 
-        digest = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:16]
+        key = str(self.root).casefold()
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         return state_dir() / f"{LOCK_NAME}-{digest}"
 
     @contextlib.contextmanager
@@ -261,9 +280,16 @@ class Archive:
         _secure_mkdir(lock_path.parent)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, FILE_MODE)
         try:
+            os.chmod(fd, FILE_MODE)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
+                # Only contention means busy. A filesystem that cannot lock
+                # (ENOLCK, EOPNOTSUPP on some network and FUSE mounts) must
+                # not be reported as a second sync the user then goes looking
+                # for.
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise
                 raise ArchiveBusy(self.root) from exc
             yield
         finally:

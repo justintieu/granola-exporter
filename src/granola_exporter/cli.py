@@ -608,27 +608,38 @@ def cmd_sync(args: argparse.Namespace) -> int:
         # per process, so a second concurrent sync would overwrite them with
         # its own stale snapshot.
         with archive.exclusive():
-            if effective == "public-api":
-                if not config.api_key:
-                    print(
-                        f"No {api_key_var(config.profile)}. "
-                        "Run 'granola-export doctor' for setup help.",
-                        file=sys.stderr,
+            # Interrupt is handled *inside* the lock: its handler writes the
+            # index, and unwinding the context manager first would release
+            # the lock before that write, which is the one case where a
+            # concurrent sync could still clobber it.
+            try:
+                if effective == "public-api":
+                    if not config.api_key:
+                        print(
+                            f"No {api_key_var(config.profile)}. "
+                            "Run 'granola-export doctor' for setup help.",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    with PublicAPIClient(config.api_key) as client:
+                        # Before sync_public_api, which writes on its first note.
+                        note = _check_account(
+                            archive,
+                            client.account_email(),
+                            config,
+                            allow_change=allow_change,
+                        )
+                        if note:
+                            print(f"  NOTE: {note}", file=sys.stderr)
+                        counts = sync_public_api(archive, client, opts)
+                else:
+                    counts = _sync_via_mcp(
+                        archive, config, opts, allow_change=allow_change
                     )
-                    return 1
-                with PublicAPIClient(config.api_key) as client:
-                    # Before sync_public_api, which writes on its first note.
-                    note = _check_account(
-                        archive,
-                        client.account_email(),
-                        config,
-                        allow_change=allow_change,
-                    )
-                    if note:
-                        print(f"  NOTE: {note}", file=sys.stderr)
-                    counts = sync_public_api(archive, client, opts)
-            else:
-                counts = _sync_via_mcp(archive, config, opts, allow_change=allow_change)
+            except KeyboardInterrupt:
+                print("\nInterrupted — saving progress.", file=sys.stderr)
+                archive.save_index()
+                return 130
     except ArchiveBusy as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -636,13 +647,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except GranolaAPIError as exc:
-        # The sync functions save the index before re-raising.
+        # The sync functions save the index before re-raising, inside the lock.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
-        print("\nInterrupted — saving progress.", file=sys.stderr)
-        archive.save_index()
-        return 130
 
     print(f"Done: {counts.summary()}")
     for warning in counts.warnings():
